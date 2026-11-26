@@ -1509,16 +1509,21 @@ where
 }
 
 /// The capped opp-move build on append-only buffers. Takes the old belief list
-/// by value so it can be freed before the final compaction. Returns
-/// (positions sorted by key, raw, pre_cap_count, was_downsampled), the same
-/// tuple as `opp_move_core`.
-fn opp_move_bottomk_append(
-    prev: Vec<PackedPos>,
+/// by value so it can be freed before the final compaction. Reads records with
+/// `cin` and writes them with `cout` (full PackedPos, or compact records for
+/// fix 3). Returns (records sorted by key, raw, pre_cap_count,
+/// was_downsampled), the same tuple as `opp_move_core`, or the untouched old
+/// list when a child does not fit `cout` (compact only), for the caller's
+/// fallback.
+fn opp_move_bottomk_append<CI: RecCodec, CO: RecCodec>(
+    prev: Vec<CI::R>,
+    cin: &CI,
+    cout: &CO,
     k: usize,
     opp_white: bool,
     perspective_white: bool,
     o: &OppObs,
-) -> (Vec<PackedPos>, usize, usize, bool) {
+) -> Result<(Vec<CO::R>, usize, usize, bool), Vec<CI::R>> {
     let opp = if opp_white { Color::White } else { Color::Black };
     let perspective = if perspective_white { Color::White } else { Color::Black };
     let record_stats = std::env::var_os("FOW_PRUNE_STATS").is_some();
@@ -1528,28 +1533,36 @@ fn opp_move_bottomk_append(
     let chunk = bottomk_append_chunk();
     let prev_len = prev.len();
 
-    let mut buf: Vec<PackedPos> = Vec::new();
+    let mut buf: Vec<CO::R> = Vec::new();
     let mut tau = u64::MAX;
     let mut downsampled = false;
     let mut raw = 0usize;
     let mut pruned = 0usize;
-    let hash = |p: &PackedPos| hash_packed(p);
+    let misfit = AtomicBool::new(false);
+    // The bottom-K hash is always that of the full world.
+    let hash = |r: &CO::R| hash_packed(&cout.get(r));
 
     for ch in prev.chunks(chunk) {
+        if misfit.load(Ordering::Relaxed) {
+            break;
+        }
         let t = tau;
-        let parts: Vec<(Vec<PackedPos>, usize, usize)> = ch
+        let parts: Vec<(Vec<CO::R>, usize, usize)> = ch
             .par_iter()
             .fold(
                 || (Vec::new(), 0usize, 0usize),
-                |(mut v, mut lraw, mut lpr), pp| {
-                    let s = unpack(pp);
+                |(mut v, mut lraw, mut lpr), rec| {
+                    let s = unpack(&cin.get(rec));
                     if s.turn == opp {
                         for_each_consistent_opp_child(&s, opp, perspective, o, do_prune, &mut lpr,
                             |next| {
                                 lraw += 1;
                                 let p = pack(next);
                                 if hash_packed(&p) <= t {
-                                    v.push(p);
+                                    match cout.put(&p) {
+                                        Some(r) => v.push(r),
+                                        None => misfit.store(true, Ordering::Relaxed),
+                                    }
                                 }
                             });
                     }
@@ -1570,6 +1583,9 @@ fn opp_move_bottomk_append(
             reserve_for(&mut buf, part.len(), full_cap);
             buf.extend_from_slice(&part);
         }
+    }
+    if misfit.into_inner() {
+        return Err(prev);
     }
     // Every predecessor is expanded: the old list is no longer needed.
     drop(prev);
@@ -1597,7 +1613,377 @@ fn opp_move_bottomk_append(
     } else {
         final_len
     };
-    (buf, raw, pre_cap_count, downsampled)
+    Ok((buf, raw, pre_cap_count, downsampled))
+}
+
+// ---------------------------------------------------------------------------
+// Compact belief records (FOW_PSTATE_COMPACT=1; with FOW_BOTTOMK_APPEND=1 and a
+// bottom-K cap).
+//
+// Every world of one belief list shares the perspective's own pieces (it always
+// sees them), the castling rights other than the opponent's two corner rooks,
+// the fullmove number and the side to move. Those go in ONE `ListHeader`; each
+// world keeps only the opponent's part in a 16-byte `OppRec` instead of a
+// 56-byte PackedPos.
+//
+// OppRec is a 128-bit string, most significant bit first:
+//   * the 64 squares in PackedPos order (a1..h2 group from h2 down to a1, then
+//     a3..h4 from h4 down, ...): an empty or own square is a 0 bit, an
+//     opponent piece is a 1 bit and its 3-bit role (1 pawn .. 6 king);
+//     at most 64 + 16 * 3 = 112 bits;
+//   * then 2 bits opponent corner castling (h, a), 10 bits halfmove clock,
+//     4 bits en-passant file + 1 (0 = none);
+//   * zero padding.
+// Comparing two OppRec of the SAME list as integers gives the same order as
+// comparing their full PackedPos: the own nibbles are equal and disjoint from
+// the opponent nibbles, so PackedPos order is the lexicographic order of the
+// opponent nibbles in that square order, and the string above is
+// prefix-comparable square by square (empty < piece, then role). So sorting
+// OppRec IS `canonicalize_order`, and get_by_index returns the same world at
+// the same index as the original.
+//
+// The bottom-K hash is always hash_packed of the full PackedPos (rebuilt from
+// header + record), so the kept sample is the original's.
+//
+// A world that does not fit the header (it never happened in our games; see
+// FOW_ASSERT_OWN_SHARED) makes that update fall back to full PackedPos records.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct ListHeader {
+    own_white: bool,
+    own_nib: [u64; 4],
+    castle_rest: u64,
+    fullmoves: u32,
+    turn_white: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+struct OppRec {
+    hi: u64,
+    lo: u64,
+}
+
+#[inline]
+fn opp_corner_bits(own_white: bool) -> (u64, u64) {
+    // (a-file corner, h-file corner) of the OPPONENT's back rank.
+    if own_white { (1u64 << 56, 1u64 << 63) } else { (1u64 << 0, 1u64 << 7) }
+}
+
+#[inline]
+fn ep_rank_for(turn_white: bool) -> u8 {
+    // The side to move captures en passant; the square is on the mover-before's
+    // third rank: rank 6 (index 5) when white is to move, rank 3 (index 2) else.
+    if turn_white { 5 } else { 2 }
+}
+
+/// Split a full world into (header, opponent record). None if it cannot be
+/// encoded (more than 16 opponent pieces, odd castling or en-passant square,
+/// halfmove clock >= 1024).
+#[inline]
+fn split_packed(p: &PackedPos, own_white: bool) -> Option<(ListHeader, OppRec)> {
+    let own_lo: u8 = if own_white { 1 } else { 7 };
+    let mut own_nib = [0u64; 4];
+    let mut acc: u128 = 0;
+    let mut len: u32 = 0;
+    for g in 0..4 {
+        let x = p.board[g];
+        for j in (0..16).rev() {
+            let c = ((x >> (4 * j)) & 15) as u8;
+            if c == 0 {
+                acc <<= 1;
+                len += 1;
+            } else if c >= own_lo && c < own_lo + 6 {
+                own_nib[g] |= (c as u64) << (4 * j);
+                acc <<= 1;
+                len += 1;
+            } else {
+                let role = if c > 6 { c - 6 } else { c };
+                acc = (acc << 4) | (8 | role as u128);
+                len += 4;
+            }
+        }
+    }
+    if len > 112 {
+        return None;
+    }
+    let (a_bit, h_bit) = opp_corner_bits(own_white);
+    let castle2 = (((p.castling & h_bit) != 0) as u128) << 1 | ((p.castling & a_bit) != 0) as u128;
+    let castle_rest = p.castling & !(a_bit | h_bit);
+    if p.halfmoves >= 1024 {
+        return None;
+    }
+    let ep4: u128 = if p.ep == 0 {
+        0
+    } else {
+        let sq = p.ep - 1;
+        if sq / 8 != ep_rank_for(p.turn_white) {
+            return None;
+        }
+        (sq % 8) as u128 + 1
+    };
+    acc = (acc << 2) | castle2;
+    acc = (acc << 10) | p.halfmoves as u128;
+    acc = (acc << 4) | ep4;
+    len += 16;
+    let key = acc << (128 - len);
+    Some((
+        ListHeader { own_white, own_nib, castle_rest, fullmoves: p.fullmoves, turn_white: p.turn_white },
+        OppRec { hi: (key >> 64) as u64, lo: key as u64 },
+    ))
+}
+
+/// Rebuild the full world from its list header and record.
+#[inline]
+fn join_packed(h: &ListHeader, r: &OppRec) -> PackedPos {
+    let mut k: u128 = ((r.hi as u128) << 64) | r.lo as u128;
+    let opp_off: u64 = if h.own_white { 6 } else { 0 };
+    let mut board = h.own_nib;
+    let mut t: u32 = 0;
+    while t < 64 {
+        let z = k.leading_zeros().min(64 - t);
+        t += z;
+        k <<= z;
+        if t >= 64 {
+            break;
+        }
+        let role = ((k >> 124) & 7) as u64;
+        k <<= 4;
+        let g = (t / 16) as usize;
+        let j = 15 - (t % 16);
+        board[g] |= (role + opp_off) << (4 * j);
+        t += 1;
+    }
+    let castle2 = (k >> 126) as u64;
+    let half = ((k >> 116) & 0x3ff) as u32;
+    let ep4 = ((k >> 112) & 0xf) as u8;
+    let (a_bit, h_bit) = opp_corner_bits(h.own_white);
+    let castling = h.castle_rest
+        | if castle2 & 1 != 0 { a_bit } else { 0 }
+        | if castle2 & 2 != 0 { h_bit } else { 0 };
+    PackedPos {
+        board,
+        castling,
+        halfmoves: half,
+        fullmoves: h.fullmoves,
+        ep: if ep4 == 0 { 0 } else { ep_rank_for(h.turn_white) * 8 + (ep4 - 1) + 1 },
+        turn_white: h.turn_white,
+    }
+}
+
+/// How a build reads and writes one belief record.
+trait RecCodec: Sync {
+    type R: Copy + Ord + Send + Sync;
+    /// None: the world does not fit this list (compact only).
+    fn put(&self, p: &PackedPos) -> Option<Self::R>;
+    fn get(&self, r: &Self::R) -> PackedPos;
+}
+
+struct FullCodec;
+
+impl RecCodec for FullCodec {
+    type R = PackedPos;
+    #[inline]
+    fn put(&self, p: &PackedPos) -> Option<PackedPos> {
+        Some(*p)
+    }
+    #[inline]
+    fn get(&self, r: &PackedPos) -> PackedPos {
+        *r
+    }
+}
+
+struct CompactCodec {
+    hdr: ListHeader,
+}
+
+impl RecCodec for CompactCodec {
+    type R = OppRec;
+    #[inline]
+    fn put(&self, p: &PackedPos) -> Option<OppRec> {
+        match split_packed(p, self.hdr.own_white) {
+            Some((h, r)) if h == self.hdr => Some(r),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn get(&self, r: &OppRec) -> PackedPos {
+        join_packed(&self.hdr, r)
+    }
+}
+
+/// The belief list: full records (the original), or one header + compact records.
+enum Store {
+    Full(Vec<PackedPos>),
+    Compact { hdr: ListHeader, recs: Vec<OppRec> },
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Store::Full(Vec::new())
+    }
+}
+
+impl Store {
+    fn len(&self) -> usize {
+        match self {
+            Store::Full(v) => v.len(),
+            Store::Compact { recs, .. } => recs.len(),
+        }
+    }
+
+    fn get(&self, i: usize) -> Option<PackedPos> {
+        match self {
+            Store::Full(v) => v.get(i).copied(),
+            Store::Compact { hdr, recs } => recs.get(i).map(|r| join_packed(hdr, r)),
+        }
+    }
+
+    /// The full records (decodes a compact list; used only when the compact
+    /// flag is turned off in the middle of a game).
+    fn into_full(self) -> Vec<PackedPos> {
+        match self {
+            Store::Full(v) => v,
+            Store::Compact { hdr, recs } => recs.par_iter().map(|r| join_packed(&hdr, r)).collect(),
+        }
+    }
+
+    fn record_bytes(&self) -> usize {
+        match self {
+            Store::Full(_) => std::mem::size_of::<PackedPos>(),
+            Store::Compact { .. } => std::mem::size_of::<OppRec>(),
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        match self {
+            Store::Full(v) => v.capacity(),
+            Store::Compact { recs, .. } => recs.capacity(),
+        }
+    }
+}
+
+/// The header of the list a build will write: taken from the first child the
+/// build would produce (all children must share it; a child that does not
+/// makes the build fall back to full records).
+fn first_child_header<CI: RecCodec>(
+    prev: &[CI::R],
+    cin: &CI,
+    own_white: bool,
+    mut child: impl FnMut(&Setup) -> Option<Setup>,
+) -> Option<ListHeader> {
+    for r in prev {
+        let s = unpack(&cin.get(r));
+        if let Some(n) = child(&s) {
+            return split_packed(&pack(&n), own_white).map(|(h, _)| h);
+        }
+    }
+    None
+}
+
+/// The perspective's own move applied to one world (None: the move is not
+/// pseudo-legal there, or the result contradicts the post-move observation).
+/// The per-world body of `own_move_core`.
+#[inline]
+fn own_move_child(
+    prev_setup: &Setup,
+    perspective: Color,
+    from_idx: u8,
+    to_idx: u8,
+    promo: u8,
+    obs_filter: &Option<(u64, [u64; 6], [u64; 6])>,
+) -> Option<Setup> {
+    if prev_setup.turn != perspective {
+        return None;
+    }
+    let moves = gen_fow_pseudo_legal_moves(prev_setup, perspective);
+    if !moves.iter().any(|(f, t, p)| *f == from_idx && *t == to_idx && *p == promo) {
+        return None;
+    }
+    let from = unsafe { Square::new_unchecked(from_idx as u32) };
+    let to = unsafe { Square::new_unchecked(to_idx as u32) };
+    let next_setup = apply_move_to_setup(prev_setup, from, to, role_from_int(promo));
+    if let Some((vis, ow, ob)) = obs_filter {
+        if !visible_consistent(&next_setup, perspective, *vis, ow, ob) {
+            return None;
+        }
+    }
+    Some(next_setup)
+}
+
+/// Own move on a list, writing compact records: map every world (at most one
+/// child each), then sort + dedup. No hash sets. Returns (store, raw); the
+/// store is Full if a child did not fit the header.
+fn own_move_records<CI: RecCodec>(
+    prev: &[CI::R],
+    cin: &CI,
+    perspective_white: bool,
+    from_idx: u8,
+    to_idx: u8,
+    promo: u8,
+    obs_filter: Option<(u64, [u64; 6], [u64; 6])>,
+) -> (Store, usize) {
+    let perspective = if perspective_white { Color::White } else { Color::Black };
+    let child = |s: &Setup| own_move_child(s, perspective, from_idx, to_idx, promo, &obs_filter);
+    let hdr = match first_child_header(prev, cin, perspective_white, child) {
+        Some(h) => h,
+        None => {
+            // No child at all (empty P), or the first child cannot be encoded.
+            let mut v: Vec<PackedPos> = prev
+                .par_iter()
+                .filter_map(|r| child(&unpack(&cin.get(r))).map(|n| pack(&n)))
+                .collect();
+            let raw = v.len();
+            if raw > 0 {
+                compact_fallback("own move: the first child does not fit a 16-byte record");
+            }
+            v.par_sort_unstable();
+            v.dedup();
+            return (Store::Full(v), raw);
+        }
+    };
+    let cout = CompactCodec { hdr };
+    let misfit = AtomicBool::new(false);
+    let mut recs: Vec<OppRec> = prev
+        .par_iter()
+        .filter_map(|r| {
+            let n = child(&unpack(&cin.get(r)))?;
+            match cout.put(&pack(&n)) {
+                Some(rec) => Some(rec),
+                None => {
+                    misfit.store(true, Ordering::Relaxed);
+                    None
+                }
+            }
+        })
+        .collect();
+    if misfit.into_inner() {
+        drop(recs);
+        compact_fallback("own move: a world does not fit the list header");
+        let mut v: Vec<PackedPos> = prev
+            .par_iter()
+            .filter_map(|r| child(&unpack(&cin.get(r))).map(|n| pack(&n)))
+            .collect();
+        let raw = v.len();
+        v.par_sort_unstable();
+        v.dedup();
+        return (Store::Full(v), raw);
+    }
+    let raw = recs.len();
+    recs.par_sort_unstable();
+    recs.dedup();
+    (Store::Compact { hdr, recs }, raw)
+}
+
+/// Updates that had to fall back to full records (a world did not fit the
+/// list header). Exposed in memory_stats, and each one is logged to stderr:
+/// in our games there were none, which is the check that Misty's own pieces
+/// (and the rest of the header) are the same in every world of P.
+static COMPACT_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+fn compact_fallback(why: &str) {
+    COMPACT_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    eprintln!("[compact] fallback to full records: {why}");
 }
 
 #[pyfunction]
@@ -4584,7 +4970,9 @@ impl EqEngine {
 
 #[pyclass]
 pub struct PEnumState {
-    positions: Vec<PackedPos>,
+    // The belief list. Full PackedPos records (the original), or with
+    // FOW_PSTATE_COMPACT=1 one shared header + 16-byte opponent records.
+    store: Store,
     last_raw: usize,
     last_pre_cap: usize,
     last_downsampled: bool,
@@ -4612,10 +5000,101 @@ impl PEnumState {
     /// Safe: PHASH parity is unaffected (the golden trace hashes SORTED FENs;
     /// `positions` crosses to Python as a frozenset), and a uniform index sample
     /// is uniform regardless of order, so the sampling distribution is identical.
+    ///
+    /// Compact lists sort by OppRec, which is the same order (see OppRec).
     #[inline]
     fn canonicalize_order(&mut self) {
-        self.positions.par_sort_unstable();
+        match &mut self.store {
+            Store::Full(v) => v.par_sort_unstable(),
+            Store::Compact { recs, .. } => recs.par_sort_unstable(),
+        }
     }
+
+    /// The full-record list, for the original code paths. Decodes a compact
+    /// list first (only when the compact flag goes off in the middle of a game).
+    fn full_mut(&mut self) -> &mut Vec<PackedPos> {
+        if let Store::Compact { .. } = self.store {
+            let s = std::mem::take(&mut self.store);
+            self.store = Store::Full(s.into_full());
+        }
+        match &mut self.store {
+            Store::Full(v) => v,
+            Store::Compact { .. } => unreachable!(),
+        }
+    }
+
+    /// Fix 3 is on: compact records, which ride on the append-only bottom-K
+    /// build (fix 2) and need the cap.
+    fn compact_on(&self) -> bool {
+        self.bottomk_cap.is_some()
+            && env_flag("FOW_PSTATE_COMPACT")
+            && env_flag("FOW_BOTTOMK_APPEND")
+    }
+
+    /// FOW_ASSERT_OWN_SHARED=1: check that every world of the list shares the
+    /// header part (own pieces, castling other than the opponent corners,
+    /// fullmove number, side to move) and fits a 16-byte record. The check
+    /// that fix 3 rests on; run on real games before trusting it.
+    fn assert_shared(&self, perspective_white: bool) -> PyResult<()> {
+        if !env_flag("FOW_ASSERT_OWN_SHARED") || self.store.len() == 0 {
+            return Ok(());
+        }
+        let first = self.store.get(0).expect("non-empty");
+        let hdr = match split_packed(&first, perspective_white) {
+            Some((h, _)) => h,
+            None => {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "FOW_ASSERT_OWN_SHARED: world 0 does not fit a 16-byte record: {}",
+                    Fen(unpack(&first))
+                )))
+            }
+        };
+        let bad = (0..self.store.len()).into_par_iter().find_any(|&i| {
+            let p = self.store.get(i).expect("in range");
+            !matches!(split_packed(&p, perspective_white), Some((h, _)) if h == hdr)
+        });
+        if let Some(i) = bad {
+            let p = self.store.get(i).expect("in range");
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "FOW_ASSERT_OWN_SHARED: world {} differs from world 0 in the shared part: {} vs {}",
+                i, Fen(unpack(&p)), Fen(unpack(&first))
+            )));
+        }
+        Ok(())
+    }
+
+    /// Own move through the record builder (compact on).
+    fn own_move_compact(
+        &mut self, perspective_white: bool, from_idx: u8, to_idx: u8, promo: u8,
+        obs: Option<(u64, [u64; 6], [u64; 6])>,
+    ) -> usize {
+        let (store, raw) = match &self.store {
+            Store::Full(v) => own_move_records(v, &FullCodec, perspective_white,
+                                               from_idx, to_idx, promo, obs),
+            Store::Compact { hdr, recs } => own_move_records(recs, &CompactCodec { hdr: *hdr },
+                                                             perspective_white, from_idx,
+                                                             to_idx, promo, obs),
+        };
+        self.store = store;
+        self.last_raw = raw;
+        self.last_pre_cap = self.store.len();
+        raw
+    }
+}
+
+/// First observation-consistent child of one predecessor, if any.
+fn first_opp_child(s: &Setup, opp: Color, perspective: Color, o: &OppObs) -> Option<Setup> {
+    let mut found: Option<Setup> = None;
+    let mut pruned = 0usize;
+    // for_each_consistent_opp_child has no early exit; predecessors with a
+    // consistent child are the common case, so the first one ends the scan.
+    for_each_consistent_opp_child(s, opp, perspective, o, std::env::var_os("FOW_NO_PRUNE").is_none(),
+                                  &mut pruned, |n| {
+        if found.is_none() {
+            found = Some(n.clone());
+        }
+    });
+    found
 }
 
 #[pymethods]
@@ -4626,7 +5105,7 @@ impl PEnumState {
             .iter()
             .map(|f| Ok(pack(&parse_fen_lenient(f)?)))
             .collect::<PyResult<_>>()?;
-        let mut state = PEnumState { positions, last_raw: 0, last_pre_cap: 0,
+        let mut state = PEnumState { store: Store::Full(positions), last_raw: 0, last_pre_cap: 0,
                                      last_downsampled: false, bottomk_cap: None };
         state.canonicalize_order();
         Ok(state)
@@ -4642,7 +5121,7 @@ impl PEnumState {
     }
 
     fn size(&self) -> usize {
-        self.positions.len()
+        self.store.len()
     }
 
     #[getter]
@@ -4664,13 +5143,19 @@ impl PEnumState {
     fn update_own_move(
         &mut self, perspective_white: bool, from_idx: u8, to_idx: u8, promo: u8,
     ) -> PyResult<usize> {
-        let (next, raw) = own_move_core(&self.positions, perspective_white,
+        if self.compact_on() {
+            self.own_move_compact(perspective_white, from_idx, to_idx, promo, None);
+            self.assert_shared(perspective_white)?;
+            return Ok(self.store.len());
+        }
+        let (next, raw) = own_move_core(self.full_mut(), perspective_white,
                                         from_idx, to_idx, promo, None)?;
         self.last_raw = raw;
         self.last_pre_cap = next.len();
-        self.positions = next;
+        self.store = Store::Full(next);
         self.canonicalize_order();  // reproducible get_by_index → deterministic sampling
-        Ok(self.positions.len())
+        self.assert_shared(perspective_white)?;
+        Ok(self.store.len())
     }
 
     /// Two-step own move: apply the move AND filter by the perspective's
@@ -4692,13 +5177,19 @@ impl PEnumState {
             [obs_black_pawns, obs_black_knights, obs_black_bishops,
              obs_black_rooks, obs_black_queens, obs_black_kings],
         ));
-        let (next, raw) = own_move_core(&self.positions, perspective_white,
+        if self.compact_on() {
+            self.own_move_compact(perspective_white, from_idx, to_idx, promo, obs);
+            self.assert_shared(perspective_white)?;
+            return Ok(self.store.len());
+        }
+        let (next, raw) = own_move_core(self.full_mut(), perspective_white,
                                         from_idx, to_idx, promo, obs)?;
         self.last_raw = raw;
         self.last_pre_cap = next.len();
-        self.positions = next;
+        self.store = Store::Full(next);
         self.canonicalize_order();  // reproducible get_by_index → deterministic sampling
-        Ok(self.positions.len())
+        self.assert_shared(perspective_white)?;
+        Ok(self.store.len())
     }
 
     /// Apply an opponent move (observation-filtered) in place. Returns new |P|.
@@ -4725,19 +5216,48 @@ impl PEnumState {
                 own_capture_idx: obs_own_capture_idx,
                 opp_capture_landing_idx: obs_opp_capture_landing_idx,
             };
+            let opp = if opp_white { Color::White } else { Color::Black };
+            let persp = if perspective_white { Color::White } else { Color::Black };
+            let compact = self.compact_on();
             // Hand the old list over so the build can free it early.
-            let prev = std::mem::take(&mut self.positions);
-            let (next, raw, pre_cap, was_ds) =
-                opp_move_bottomk_append(prev, k, opp_white, perspective_white, &o);
+            let prev = std::mem::take(&mut self.store);
+            let (store, raw, pre_cap, was_ds) = match (prev, compact) {
+                (Store::Full(v), false) => {
+                    let (n, r, p, d) = opp_move_bottomk_append(v, &FullCodec, &FullCodec, k,
+                                                               opp_white, perspective_white, &o)
+                        .unwrap_or_else(|_| unreachable!("full records always fit"));
+                    (Store::Full(n), r, p, d)
+                }
+                (Store::Compact { hdr, recs }, false) => {
+                    let v = Store::Compact { hdr, recs }.into_full();
+                    let (n, r, p, d) = opp_move_bottomk_append(v, &FullCodec, &FullCodec, k,
+                                                               opp_white, perspective_white, &o)
+                        .unwrap_or_else(|_| unreachable!("full records always fit"));
+                    (Store::Full(n), r, p, d)
+                }
+                (Store::Full(v), true) => {
+                    let out = first_child_header(&v, &FullCodec, perspective_white,
+                                                 |s| first_opp_child(s, opp, persp, &o));
+                    opp_append_to_compact(v, &FullCodec, out, k, opp_white, perspective_white, &o)
+                }
+                (Store::Compact { hdr, recs }, true) => {
+                    let cin = CompactCodec { hdr };
+                    let out = first_child_header(&recs, &cin, perspective_white,
+                                                 |s| first_opp_child(s, opp, persp, &o));
+                    opp_append_to_compact(recs, &cin, out, k, opp_white, perspective_white, &o)
+                }
+            };
+            self.store = store;
             self.last_raw = raw;
             self.last_pre_cap = pre_cap;
             self.last_downsampled = was_ds;
-            self.positions = next;
             self.canonicalize_order();  // already in key order: a cheap check
-            return Ok(self.positions.len());
+            self.assert_shared(perspective_white)?;
+            return Ok(self.store.len());
         }
+        let cap = self.bottomk_cap;
         let (next, raw, pre_cap, was_ds) = opp_move_core(
-            &self.positions, self.bottomk_cap,
+            self.full_mut(), cap,
             opp_white, perspective_white, obs_visibility_mask,
             obs_white_pawns, obs_white_knights, obs_white_bishops,
             obs_white_rooks, obs_white_queens, obs_white_kings,
@@ -4753,9 +5273,10 @@ impl PEnumState {
         if self.bottomk_cap.is_some() {
             self.last_downsampled = was_ds;
         }
-        self.positions = next;
+        self.store = Store::Full(next);
         self.canonicalize_order();  // reproducible get_by_index → deterministic sampling
-        Ok(self.positions.len())
+        self.assert_shared(perspective_white)?;
+        Ok(self.store.len())
     }
 
     /// Downsample to `max_size` uniformly at random IN RUST, deterministically,
@@ -4763,20 +5284,27 @@ impl PEnumState {
     /// reproducible). Partial Fisher-Yates: swap the first max_size slots with a
     /// random later index, then truncate. No-op when |P| <= max_size.
     fn downsample(&mut self, max_size: usize, mt_words: Vec<u32>, mt_index: usize) {
-        let n = self.positions.len();
+        fn fisher_yates<T>(v: &mut Vec<T>, max_size: usize, rng: &mut Mt19937) {
+            let n = v.len();
+            for i in 0..max_size {
+                // uniform j in [i, n)
+                let span = (n - i) as f64;
+                let j = i + (rng.next_f64() * span) as usize;
+                let j = if j >= n { n - 1 } else { j };
+                v.swap(i, j);
+            }
+            v.truncate(max_size);
+        }
+        let n = self.store.len();
         if n <= max_size {
             self.last_downsampled = false;
             return;
         }
         let mut rng = Mt19937::from_state(&mt_words, mt_index);
-        for i in 0..max_size {
-            // uniform j in [i, n)
-            let span = (n - i) as f64;
-            let j = i + (rng.next_f64() * span) as usize;
-            let j = if j >= n { n - 1 } else { j };
-            self.positions.swap(i, j);
+        match &mut self.store {
+            Store::Full(v) => fisher_yates(v, max_size, &mut rng),
+            Store::Compact { recs, .. } => fisher_yates(recs, max_size, &mut rng),
         }
-        self.positions.truncate(max_size);
         self.last_downsampled = true;
     }
 
@@ -4786,32 +5314,73 @@ impl PEnumState {
     fn get_by_index(&self, indices: Vec<usize>) -> Vec<String> {
         indices
             .iter()
-            .filter_map(|&i| self.positions.get(i).map(|p| Fen(unpack(p)).to_string()))
+            .filter_map(|&i| self.store.get(i).map(|p| Fen(unpack(&p)).to_string()))
             .collect()
     }
 
     /// Snapshot all positions (escape hatch for invariants/debug; avoid on the
     /// hot path — defeats the point of keeping P in Rust).
     fn all_positions(&self) -> Vec<String> {
-        self.positions.par_iter().map(|p| Fen(unpack(p)).to_string()).collect()
+        (0..self.store.len())
+            .into_par_iter()
+            .map(|i| Fen(unpack(&self.store.get(i).expect("in range"))).to_string())
+            .collect()
     }
 
     /// Per-component byte counts for the belief representation. Lets the
     /// caller (memory profiler / bakeoff telemetry) attribute the
     /// non-Python residual — the dominant unmeasured RSS contributor per
     /// memory-profile-monotonic. `positions_capacity_bytes` is the packed
-    /// belief; `positions_size_bytes` is the live |P| × PackedPos size.
+    /// belief; `positions_size_bytes` is the live |P| × record size.
     fn memory_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
         let d = pyo3::types::PyDict::new(py);
-        let entry = std::mem::size_of::<PackedPos>();
-        d.set_item("n_positions", self.positions.len())?;
-        d.set_item("positions_size_bytes", self.positions.len() * entry)?;
-        d.set_item("positions_capacity_bytes", self.positions.capacity() * entry)?;
+        let entry = self.store.record_bytes();
+        d.set_item("n_positions", self.store.len())?;
+        d.set_item("positions_size_bytes", self.store.len() * entry)?;
+        d.set_item("positions_capacity_bytes", self.store.capacity() * entry)?;
         d.set_item("packed_pos_bytes", entry)?;
+        d.set_item("compact", matches!(self.store, Store::Compact { .. }))?;
+        d.set_item("compact_fallbacks", COMPACT_FALLBACKS.load(Ordering::Relaxed))?;
         d.set_item("last_raw", self.last_raw)?;
         d.set_item("last_pre_cap", self.last_pre_cap)?;
         Ok(d)
     }
+}
+
+/// The capped opp-move build writing compact records under `out` (the header
+/// of the first child). Falls back to full records when there is no header or a
+/// child does not fit it.
+fn opp_append_to_compact<CI: RecCodec>(
+    prev: Vec<CI::R>,
+    cin: &CI,
+    out: Option<ListHeader>,
+    k: usize,
+    opp_white: bool,
+    perspective_white: bool,
+    o: &OppObs,
+) -> (Store, usize, usize, bool) {
+    let prev = match out {
+        Some(hdr) => {
+            match opp_move_bottomk_append(prev, cin, &CompactCodec { hdr }, k, opp_white,
+                                          perspective_white, o) {
+                Ok((recs, r, p, d)) => return (Store::Compact { hdr, recs }, r, p, d),
+                Err(prev) => {
+                    compact_fallback("opp move: a world does not fit the list header");
+                    prev
+                }
+            }
+        }
+        None => {
+            if prev.len() > 0 {
+                compact_fallback("opp move: no child header (no child, or it does not fit)");
+            }
+            prev
+        }
+    };
+    let (n, r, p, d) = opp_move_bottomk_append(prev, cin, &FullCodec, k, opp_white,
+                                               perspective_white, o)
+        .unwrap_or_else(|_| unreachable!("full records always fit"));
+    (Store::Full(n), r, p, d)
 }
 
 // Variant game modules (Dark Mini Xiangqi, Full Dark Xiangqi): compiled only
@@ -4931,5 +5500,62 @@ mod tests {
         let italian =
             "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4";
         assert_eq!(visible_squares(italian, true).unwrap(), 0x20115adfefffff);
+    }
+
+    /// Fix 3: a world split into (list header, 16-byte record) joins back to
+    /// the same PackedPos, and within one list the record order is the
+    /// PackedPos order (so a sorted compact list is in canonical order).
+    #[test]
+    fn compact_record_roundtrip_and_order() {
+        use std::collections::HashMap;
+        let start = pack(&parse_fen_lenient(STARTPOS).unwrap());
+        for own_white in [true, false] {
+            let own = if own_white { Color::White } else { Color::Black };
+            let mut seed: u64 = 0x9E3779B97F4A7C15 ^ (own_white as u64);
+            let mut next = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            };
+            let mut worlds: Vec<PackedPos> = Vec::new();
+            for _walk in 0..400 {
+                let mut s = unpack(&start);
+                for _ply in 0..36 {
+                    let moves = gen_fow_pseudo_legal_moves(&s, s.turn);
+                    if moves.is_empty() || s.board.kings().count() < 2 {
+                        break;
+                    }
+                    // The own side plays a fixed line, the opponent a random
+                    // one: many worlds then share one header, as in a belief.
+                    let (f, t, pr) = if s.turn == own {
+                        moves[0]
+                    } else {
+                        moves[(next() % moves.len() as u64) as usize]
+                    };
+                    let from = unsafe { Square::new_unchecked(f as u32) };
+                    let to = unsafe { Square::new_unchecked(t as u32) };
+                    s = apply_move_to_setup(&s, from, to, role_from_int(pr));
+                    worlds.push(pack(&s));
+                }
+            }
+            worlds.sort();
+            worlds.dedup();
+            let mut groups: HashMap<ListHeader, Vec<(PackedPos, OppRec)>> = HashMap::new();
+            for p in &worlds {
+                let (h, r) = split_packed(p, own_white).expect("standard game worlds fit");
+                assert!(join_packed(&h, &r) == *p, "round trip");
+                groups.entry(h).or_default().push((*p, r));
+            }
+            let mut compared = 0usize;
+            for (_, mut g) in groups {
+                g.sort_by(|a, b| a.0.cmp(&b.0));
+                for w in g.windows(2) {
+                    assert!(w[0].1 < w[1].1, "record order != PackedPos order");
+                    compared += 1;
+                }
+            }
+            assert!(compared > 1000, "too few same-header pairs: {compared}");
+        }
     }
 }

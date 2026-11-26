@@ -35,6 +35,10 @@ MODES = {
     "fix2-append": {"FOW_BOTTOMK_LOW_WATERMARK": "1", "FOW_BOTTOMK_APPEND": "1"},
     # Tiny chunks: many intermediate compactions even on small fixtures.
     "fix2-append-chunk7": {"FOW_BOTTOMK_APPEND": "1", "FOW_BOTTOMK_APPEND_CHUNK": "7"},
+    "fix3-compact": {"FOW_BOTTOMK_LOW_WATERMARK": "1", "FOW_BOTTOMK_APPEND": "1",
+                     "FOW_PSTATE_COMPACT": "1", "FOW_ASSERT_OWN_SHARED": "1"},
+    "fix3-compact-chunk7": {"FOW_BOTTOMK_APPEND": "1", "FOW_BOTTOMK_APPEND_CHUNK": "7",
+                            "FOW_PSTATE_COMPACT": "1"},
 }
 
 
