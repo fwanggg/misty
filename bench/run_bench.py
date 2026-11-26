@@ -96,7 +96,7 @@ def oom_killed(pid: int) -> bool:
 def run_game(args, seed: int, env: dict) -> dict:
     gdir = Path(args.out) / args.variant / f"seed-{seed:03d}"
     gdir.mkdir(parents=True, exist_ok=True)
-    for name in ("moves.jsonl", "perply.jsonl", "result.json"):
+    for name in ("moves.jsonl", "perply.jsonl", "result.json", "phase_rss.json"):
         (gdir / name).unlink(missing_ok=True)
     cmd = [args.python, str(HERE / "play_one.py"), "--seed", str(seed),
            "--iters", str(args.iters), "--max-plies", str(args.max_plies),
@@ -161,6 +161,7 @@ def run_game(args, seed: int, env: dict) -> dict:
     mt = move_times(perply)
     obs = [r for r in perply if r.get("kind", "").startswith("observe")]
     res = json.loads((gdir / "result.json").read_text()) if (gdir / "result.json").exists() else {}
+    phase_rss = json.loads((gdir / "phase_rss.json").read_text()) if (gdir / "phase_rss.json").exists() else {}
     row = {
         "variant": args.variant,
         "seed": seed,
@@ -179,6 +180,7 @@ def run_game(args, seed: int, env: dict) -> dict:
         "max_p": max((r.get("p_post", 0) for r in obs), default=0),
         "max_m_est": max((r.get("p_pre_cap", 0) for r in obs), default=0),
         "cap_fires": sum(1 for r in obs if r.get("downsampled")),
+        "peak_rss_by_phase_mb": phase_rss,
         "moves": " ".join(m["uci"] for m in moves),
     }
     (gdir / "summary.json").write_text(json.dumps(row) + "\n")

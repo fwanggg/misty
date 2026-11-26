@@ -10,6 +10,9 @@ Files in --out-dir (all flushed per line, so an OOM SIGKILL keeps the prefix):
   moves.jsonl   one line per ply: {"ply", "color", "uci"}
   perply.jsonl  Misty's own telemetry rows (EngineV2Strategy sink)
   result.json   written only when the game finishes normally
+  phase_rss.json  this process's peak RSS (MB) per phase of Misty's turn:
+                observe_own_move / observe_opp_move / pick_move / other
+                (sampled every 0.1 s, rewritten at most every 0.5 s)
 
 The parent (bench/run_bench.py) reads this process's peak RSS (VmHWM) from
 /proc while it runs, so it has the number even when the kernel kills it.
@@ -57,6 +60,48 @@ class RemoteStrategy:
         return self.call("pick", view)
 
 
+def _rss_mb() -> float:
+    with open("/proc/self/statm") as f:
+        return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 2**20
+
+
+def track_phases(strategy, out_path: Path) -> None:
+    """Tag Misty's belief updates and search, and keep the peak RSS of each."""
+    import threading
+
+    phase = {"name": "other"}
+    peaks: dict[str, float] = {}
+
+    for name in ("observe_own_move", "observe_opp_move", "pick_move"):
+        inner = getattr(strategy, name)
+
+        def wrapped(*a, _inner=inner, _name=name, **kw):
+            phase["name"] = _name
+            try:
+                return _inner(*a, **kw)
+            finally:
+                phase["name"] = "other"
+
+        setattr(strategy, name, wrapped)
+
+    def sample() -> None:
+        last_write = 0.0
+        dirty = False
+        while True:
+            ph = phase["name"]
+            rss = _rss_mb()
+            if rss > peaks.get(ph, 0.0):
+                peaks[ph] = round(rss, 1)
+                dirty = True
+            now = time.monotonic()
+            if dirty and now - last_write > 0.5:
+                out_path.write_text(json.dumps(peaks) + "\n")
+                last_write, dirty = now, False
+            time.sleep(0.1)
+
+    threading.Thread(target=sample, daemon=True).start()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--seed", type=int, required=True)
@@ -97,6 +142,7 @@ def main() -> int:
         capture_telemetry=True,
     )
     misty.set_telemetry_sink(str(out / "perply.jsonl"))
+    track_phases(misty, out / "phase_rss.json")
     if args.opp == "remote":
         rfd, wfd = (int(x) for x in args.opp_fds.split(","))
         opp = RemoteStrategy(rfd, wfd)
