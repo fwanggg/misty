@@ -175,9 +175,24 @@ fn hash_packed(p: &PackedPos) -> u64 {
 /// calling DashSet::len() (a sum over shards) on every insert. Per-thread.
 const BOTTOMK_CHECK_INTERVAL: usize = 8192;
 
+/// Periodic bottom-K compaction trigger (the DashSet high-watermark).
+///
+/// Default 2K (the original). `FOW_BOTTOMK_LOW_WATERMARK=1` lowers it to
+/// K + K/4: the set then never holds more than ~1.25K worlds, and its
+/// power-of-two shard tables stay one size smaller. The final bottom-K is the
+/// same set either way: a periodic pass only lowers the threshold to the K-th
+/// smallest hash of a SUBSET of the worlds, which is >= the true K-th hash.
+fn bottomk_periodic_trigger(k: usize) -> usize {
+    match std::env::var("FOW_BOTTOMK_LOW_WATERMARK") {
+        Ok(v) if !v.is_empty() && v != "0" => k + k / 4,
+        _ => 2 * k,
+    }
+}
+
 /// Compact a bottom-K DashSet down to its K smallest-hash worlds.
 ///
-/// Periodic (final_pass=false): only fires when |kept| > 2K, the memory
+/// Periodic (final_pass=false): only fires when |kept| > `periodic_trigger`
+/// (2K by default, see `bottomk_periodic_trigger`), the memory
 /// high-watermark; one worker claims it via `compacting`, the rest skip and
 /// keep inserting against the (lowered) threshold. Final (final_pass=true):
 /// post-loop, single-threaded, fires when |kept| > K so the result lands at
@@ -192,8 +207,9 @@ fn compact_bottom_k(
     compacting: &AtomicBool,
     downsampled: &AtomicBool,
     final_pass: bool,
+    periodic_trigger: usize,
 ) {
-    let trigger = if final_pass { k } else { 2 * k };
+    let trigger = if final_pass { k } else { periodic_trigger };
     if kept.len() <= trigger {
         return;
     }
@@ -1119,6 +1135,7 @@ fn opp_move_core(
     let threshold = AtomicU64::new(u64::MAX);
     let compacting = AtomicBool::new(false);
     let downsampled = AtomicBool::new(false);
+    let periodic_trigger = cap.map(bottomk_periodic_trigger).unwrap_or(usize::MAX);
     prev.par_iter().for_each_init(
         || 0usize,
         |since_check: &mut usize, pp| {
@@ -1216,7 +1233,7 @@ fn opp_move_core(
                     if *since_check >= BOTTOMK_CHECK_INTERVAL {
                         *since_check = 0;
                         compact_bottom_k(&kept, k, &threshold, &compacting,
-                                         &downsampled, false);
+                                         &downsampled, false, periodic_trigger);
                     }
                 }
             }
@@ -1226,9 +1243,10 @@ fn opp_move_core(
     });
 
     // Final compaction: lands the result at EXACTLY the bottom-K (periodic
-    // passes only fire above 2k, so |kept| can sit in (k, 2k] here).
+    // passes only fire above the trigger, so |kept| can sit in (k, trigger]).
     if let Some(k) = cap {
-        compact_bottom_k(&kept, k, &threshold, &compacting, &downsampled, true);
+        compact_bottom_k(&kept, k, &threshold, &compacting, &downsampled, true,
+                         periodic_trigger);
     }
 
     let raw = raw.into_inner();
