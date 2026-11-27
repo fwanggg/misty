@@ -26,11 +26,15 @@ from fow_chess.observation import observation_from_transition
 from fow_chess.p_enum import PEnumerator
 from fow_chess.p_enum.enumerator import _obs_piece_bitmasks
 
-FIX_FLAGS = ("FOW_BOTTOMK_LOW_WATERMARK",)
+FIX_FLAGS = ("FOW_BOTTOMK_LOW_WATERMARK", "FOW_BOTTOMK_APPEND", "FOW_BOTTOMK_APPEND_CHUNK",
+             "FOW_PSTATE_COMPACT", "FOW_ASSERT_OWN_SHARED")
 
 MODES = {
     "original": {},
     "fix1-low-watermark": {"FOW_BOTTOMK_LOW_WATERMARK": "1"},
+    "fix2-append": {"FOW_BOTTOMK_LOW_WATERMARK": "1", "FOW_BOTTOMK_APPEND": "1"},
+    # Tiny chunks: many intermediate compactions even on small fixtures.
+    "fix2-append-chunk7": {"FOW_BOTTOMK_APPEND": "1", "FOW_BOTTOMK_APPEND_CHUNK": "7"},
 }
 
 

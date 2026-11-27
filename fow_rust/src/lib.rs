@@ -1281,6 +1281,325 @@ fn opp_move_core(
     Ok((kept.into_iter().collect(), raw, pre_cap_count, was_downsampled))
 }
 
+// ---------------------------------------------------------------------------
+// Bottom-K with append-only buffers (FOW_BOTTOMK_APPEND=1, capped path only).
+//
+// The DashSet build above holds, at its peak: the old belief list, a sharded
+// hash set of up to the trigger size (its power-of-two tables over-allocate),
+// and then a SECOND copy of the kept set while `kept.into_iter().collect()`
+// fills the new Vec. This path keeps the same bottom-K set with less:
+//
+//   * children whose hash is <= tau are APPENDED to one flat buffer (no
+//     per-insert hashing into a set, no table slack);
+//   * when the buffer would pass 1.25K, it is sorted by the full key,
+//     duplicates are removed, and only the K smallest (hash_packed, key)
+//     worlds are kept; tau drops to the K-th hash;
+//   * the old belief list is dropped as soon as the last predecessor has been
+//     expanded, BEFORE the final compaction;
+//   * the final compaction is the same pass, and the buffer itself becomes the
+//     new belief list (no copy). It leaves the list sorted by the key, which
+//     is the canonical order (`canonicalize_order` is then a no-op scan).
+//
+// Same set as the DashSet path: a world of the true bottom-K has a hash <= the
+// true K-th hash <= every tau (each tau is the K-th hash of a SUBSET), so it is
+// never filtered out and never compacted away. raw / pre_cap / downsampled are
+// computed the same way (pre_cap = K * 2^64 / tau when downsampled).
+// ---------------------------------------------------------------------------
+
+/// The observation of one opponent move, bundled for the fix paths.
+#[derive(Clone, Copy)]
+struct OppObs {
+    vis: u64,
+    w: [u64; 6],
+    b: [u64; 6],
+    own_capture_idx: i32,
+    opp_capture_landing_idx: i32,
+}
+
+fn env_flag(name: &str) -> bool {
+    matches!(std::env::var(name), Ok(v) if !v.is_empty() && v != "0")
+}
+
+/// How many predecessors are expanded between two looks at the buffer size.
+/// A test knob (`FOW_BOTTOMK_APPEND_CHUNK`) so small fixtures exercise many
+/// intermediate compactions; the default keeps a chunk's children small next
+/// to K.
+fn bottomk_append_chunk() -> usize {
+    std::env::var("FOW_BOTTOMK_APPEND_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(1 << 15)
+}
+
+#[inline]
+fn role_index(r: Role) -> usize {
+    match r {
+        Role::Pawn => 0, Role::Knight => 1, Role::Bishop => 2,
+        Role::Rook => 3, Role::Queen => 4, Role::King => 5,
+    }
+}
+
+/// Every observation-consistent child of one predecessor, in move order. A copy
+/// of the inner loop of `opp_move_core` (same pre-prune, same full check), so
+/// the original path stays as it was.
+#[inline]
+fn for_each_consistent_opp_child(
+    prev_setup: &Setup,
+    opp: Color,
+    perspective: Color,
+    o: &OppObs,
+    do_prune: bool,
+    pruned: &mut usize,
+    mut emit: impl FnMut(&Setup),
+) {
+    let all_obs_occ = o.w.iter().chain(o.b.iter()).fold(0u64, |a, b| a | b);
+    let opp_obs = if opp == Color::White { &o.w } else { &o.b };
+    let prev_own_occ = prev_setup.board.by_color(perspective).0;
+    let prev_occ = prev_setup.board.occupied().0;
+    let moves = gen_fow_pseudo_legal_moves(prev_setup, opp);
+    for (from_idx, to_idx, promo) in moves {
+        let from = unsafe { Square::new_unchecked(from_idx as u32) };
+        let to = unsafe { Square::new_unchecked(to_idx as u32) };
+        let from_bb = 1u64 << (from_idx as u32);
+        let to_bb = 1u64 << (to_idx as u32);
+        let promo_role = role_from_int(promo);
+        if do_prune {
+            let moving_role = match prev_setup.board.role_at(from) {
+                Some(r) => r,
+                None => continue,
+            };
+            let placed_role = promo_role.unwrap_or(moving_role);
+            let is_castling = moving_role == Role::King
+                && (from.file() as i32 - to.file() as i32).abs() == 2;
+            let captured_idx: i32 = if is_castling {
+                -1
+            } else if moving_role == Role::Pawn
+                && prev_setup.ep_square == Some(to)
+                && (prev_occ & to_bb) == 0
+            {
+                u8::from(Square::from_coords(to.file(), from.rank())) as i32
+            } else if (prev_own_occ & to_bb) != 0 {
+                to_idx as i32
+            } else {
+                -1
+            };
+            if captured_idx != o.own_capture_idx {
+                *pruned += 1;
+                continue;
+            }
+            if (to_bb & o.vis) != 0 && (to_bb & opp_obs[role_index(placed_role)]) == 0 {
+                *pruned += 1;
+                continue;
+            }
+            if (from_bb & o.vis) != 0 && (from_bb & all_obs_occ) != 0 {
+                *pruned += 1;
+                continue;
+            }
+        }
+        let next_setup = apply_move_to_setup(prev_setup, from, to, promo_role);
+        if !consistent_with_setup(
+            &next_setup, perspective, prev_own_occ, o.vis,
+            o.w[0], o.w[1], o.w[2], o.w[3], o.w[4], o.w[5],
+            o.b[0], o.b[1], o.b[2], o.b[3], o.b[4], o.b[5],
+            o.own_capture_idx, o.opp_capture_landing_idx,
+        ) {
+            continue;
+        }
+        emit(&next_setup);
+    }
+}
+
+/// Grow `buf` for `extra` more records without a doubling copy at belief size:
+/// small buffers grow as usual; once a buffer is large it jumps straight to
+/// `full_cap` (pages not yet written are not resident, so the reserve is cheap).
+fn reserve_for<R>(buf: &mut Vec<R>, extra: usize, full_cap: usize) {
+    let need = buf.len() + extra;
+    if need <= buf.capacity() {
+        return;
+    }
+    let target = if need >= (1 << 20) {
+        need.max(full_cap)
+    } else {
+        need.max(2 * buf.capacity()).max(1024)
+    };
+    buf.reserve_exact(target - buf.len());
+}
+
+/// The K-th smallest (hash, record) of `buf` (1-based `rank`, buf non-empty,
+/// rank <= len). Radix select on the top 16 hash bits: one histogram pass, then
+/// only the ~len/65536 records of the one bucket are sorted. No per-record
+/// memory beyond the bucket.
+fn kth_by_hash<R, H>(buf: &[R], rank: usize, hash: &H) -> (u64, R)
+where
+    R: Copy + Ord + Send + Sync,
+    H: Fn(&R) -> u64 + Sync,
+{
+    const SHIFT: u32 = 48;
+    const NB: usize = 1 << 16;
+    let hist = buf
+        .par_chunks(1 << 18)
+        .map(|c| {
+            let mut h = vec![0usize; NB];
+            for r in c {
+                h[(hash(r) >> SHIFT) as usize] += 1;
+            }
+            h
+        })
+        .reduce(
+            || vec![0usize; NB],
+            |mut a, b| {
+                for i in 0..NB {
+                    a[i] += b[i];
+                }
+                a
+            },
+        );
+    let mut before = 0usize;
+    let mut bucket = 0usize;
+    for (i, &c) in hist.iter().enumerate() {
+        if before + c >= rank {
+            bucket = i;
+            break;
+        }
+        before += c;
+    }
+    let mut cand: Vec<(u64, R)> = buf
+        .par_iter()
+        .filter_map(|r| {
+            let h = hash(r);
+            if (h >> SHIFT) as usize == bucket { Some((h, *r)) } else { None }
+        })
+        .collect();
+    cand.sort_unstable();
+    cand[rank - before - 1]
+}
+
+/// One bottom-K compaction: sort by key, drop duplicates, and when more than
+/// `k` distinct records remain keep the `max(k, 1)` smallest (hash, record)
+/// (k = 0 keeps one world, as `compact_bottom_k` does). Returns the number of
+/// distinct records and, when that is > k, the K-th hash (the new tau). The
+/// result stays sorted by key.
+fn bottomk_compact<R, H>(buf: &mut Vec<R>, k: usize, hash: &H) -> (usize, Option<u64>)
+where
+    R: Copy + Ord + Send + Sync,
+    H: Fn(&R) -> u64 + Sync,
+{
+    buf.par_sort_unstable();
+    buf.dedup();
+    let distinct = buf.len();
+    if distinct <= k || distinct == 0 {
+        return (distinct, None);
+    }
+    let keep = k.max(1);
+    let (tau_h, tau_r) = kth_by_hash(buf, keep, hash);
+    if distinct > keep {
+        let flags: Vec<bool> = buf
+            .par_iter()
+            .map(|r| (hash(r), *r) <= (tau_h, tau_r))
+            .collect();
+        let mut i = 0usize;
+        buf.retain(|_| {
+            let f = flags[i];
+            i += 1;
+            f
+        });
+    }
+    (distinct, Some(tau_h))
+}
+
+/// The capped opp-move build on append-only buffers. Takes the old belief list
+/// by value so it can be freed before the final compaction. Returns
+/// (positions sorted by key, raw, pre_cap_count, was_downsampled), the same
+/// tuple as `opp_move_core`.
+fn opp_move_bottomk_append(
+    prev: Vec<PackedPos>,
+    k: usize,
+    opp_white: bool,
+    perspective_white: bool,
+    o: &OppObs,
+) -> (Vec<PackedPos>, usize, usize, bool) {
+    let opp = if opp_white { Color::White } else { Color::Black };
+    let perspective = if perspective_white { Color::White } else { Color::Black };
+    let record_stats = std::env::var_os("FOW_PRUNE_STATS").is_some();
+    let do_prune = std::env::var_os("FOW_NO_PRUNE").is_none();
+    let trigger = k.max(1) + k / 4;
+    let full_cap = trigger + trigger / 8;
+    let chunk = bottomk_append_chunk();
+    let prev_len = prev.len();
+
+    let mut buf: Vec<PackedPos> = Vec::new();
+    let mut tau = u64::MAX;
+    let mut downsampled = false;
+    let mut raw = 0usize;
+    let mut pruned = 0usize;
+    let hash = |p: &PackedPos| hash_packed(p);
+
+    for ch in prev.chunks(chunk) {
+        let t = tau;
+        let parts: Vec<(Vec<PackedPos>, usize, usize)> = ch
+            .par_iter()
+            .fold(
+                || (Vec::new(), 0usize, 0usize),
+                |(mut v, mut lraw, mut lpr), pp| {
+                    let s = unpack(pp);
+                    if s.turn == opp {
+                        for_each_consistent_opp_child(&s, opp, perspective, o, do_prune, &mut lpr,
+                            |next| {
+                                lraw += 1;
+                                let p = pack(next);
+                                if hash_packed(&p) <= t {
+                                    v.push(p);
+                                }
+                            });
+                    }
+                    (v, lraw, lpr)
+                },
+            )
+            .collect();
+        for (part, lraw, lpr) in parts {
+            raw += lraw;
+            pruned += lpr;
+            if buf.len() + part.len() > trigger && !buf.is_empty() {
+                let (distinct, new_tau) = bottomk_compact(&mut buf, k, &hash);
+                if let Some(nt) = new_tau {
+                    tau = tau.min(nt);
+                    downsampled |= distinct > k;
+                }
+            }
+            reserve_for(&mut buf, part.len(), full_cap);
+            buf.extend_from_slice(&part);
+        }
+    }
+    // Every predecessor is expanded: the old list is no longer needed.
+    drop(prev);
+
+    let (distinct, new_tau) = bottomk_compact(&mut buf, k, &hash);
+    if let Some(nt) = new_tau {
+        tau = tau.min(nt);
+        downsampled |= distinct > k;
+    }
+    if record_stats {
+        let candidates = raw + pruned;
+        let pct = if candidates > 0 { 100.0 * (pruned as f64) / (candidates as f64) } else { 0.0 };
+        eprintln!(
+            "[prune] |P_prev|={} candidates={} pre_pruned={} ({:.1}%) consistent={} kept={}",
+            prev_len, candidates, pruned, pct, raw, buf.len()
+        );
+    }
+    let final_len = buf.len();
+    let pre_cap_count = if downsampled {
+        if tau == 0 {
+            final_len
+        } else {
+            ((final_len as u128) * (u64::MAX as u128) / (tau as u128)) as usize
+        }
+    } else {
+        final_len
+    };
+    (buf, raw, pre_cap_count, downsampled)
+}
+
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 fn update_opp_move_rust(
@@ -4396,6 +4715,27 @@ impl PEnumState {
         obs_own_capture_idx: i32,
         obs_opp_capture_landing_idx: i32,
     ) -> PyResult<usize> {
+        if let (Some(k), true) = (self.bottomk_cap, env_flag("FOW_BOTTOMK_APPEND")) {
+            let o = OppObs {
+                vis: obs_visibility_mask,
+                w: [obs_white_pawns, obs_white_knights, obs_white_bishops,
+                    obs_white_rooks, obs_white_queens, obs_white_kings],
+                b: [obs_black_pawns, obs_black_knights, obs_black_bishops,
+                    obs_black_rooks, obs_black_queens, obs_black_kings],
+                own_capture_idx: obs_own_capture_idx,
+                opp_capture_landing_idx: obs_opp_capture_landing_idx,
+            };
+            // Hand the old list over so the build can free it early.
+            let prev = std::mem::take(&mut self.positions);
+            let (next, raw, pre_cap, was_ds) =
+                opp_move_bottomk_append(prev, k, opp_white, perspective_white, &o);
+            self.last_raw = raw;
+            self.last_pre_cap = pre_cap;
+            self.last_downsampled = was_ds;
+            self.positions = next;
+            self.canonicalize_order();  // already in key order: a cheap check
+            return Ok(self.positions.len());
+        }
         let (next, raw, pre_cap, was_ds) = opp_move_core(
             &self.positions, self.bottomk_cap,
             opp_white, perspective_white, obs_visibility_mask,
